@@ -2,20 +2,30 @@ import pandas as pd
 import cv2
 import os
 import base64
-import requests
 import json
+import io
 
 import re
 from typing import Tuple, Optional
 
-# OpenAI API Key
-api_key = "your-api-key"  
+from google import genai
+from google.genai import types
+from PIL import Image
+from groq import Groq
 
-# Replace with your actual OpenAI API key
-headers = {
-  "Content-Type": "application/json",
-  "Authorization": f"Bearer {api_key}"
-}
+# API keys must be supplied via environment variables (e.g. a local .env loaded
+# by your shell or by python-dotenv). Never commit raw keys to source.
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+
+if not GEMINI_API_KEY:
+    raise RuntimeError("GEMINI_API_KEY environment variable is not set")
+if not GROQ_API_KEY:
+    raise RuntimeError("GROQ_API_KEY environment variable is not set")
+
+# Use Groq (free, no quota issues) as primary, Gemini as fallback
+groq_client = Groq(api_key=GROQ_API_KEY)
+gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
 
 timestamp_pattern = re.compile(
@@ -147,41 +157,36 @@ def answer_question(prompt, video_file, transcript_file):
 
             QUESTION_PROMPT = "Use the context from the transcript to answer the following question in a single short paragraph. Use a conversational tone, as if you are a teaching assistant answering a student's question. If the question is not related to the video, politely inform the user that you cannot answer it."
 
-            final_prompt = "System Prompt: " + SYSTEM_PROMPT + '\n' + " Relevant transcript: " + text + '\n' + "Question Prompt: " + QUESTION_PROMPT + "Question: " + '\n' + question
+            final_prompt = " Relevant transcript: " + text + '\n' + "Question Prompt: " + QUESTION_PROMPT + "\nQuestion: " + question
 
-            #print(final_prompt)
-            base64_image = encode_image(frame)
+            # Encode frame as base64 for Groq vision
+            _, buffer = cv2.imencode('.jpg', frame)
+            base64_image = base64.b64encode(buffer).decode('utf-8')
 
-            payload = {
-            "model": "gpt-4o",
-            "messages": [
-                {
-                "role": "user",
-                "content": [
-                    {
-                    "type": "text",
-                    "text": final_prompt,
-                    },
-                    {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": f"data:image/jpeg;base64,{base64_image}"
-                    }
-                    }
-                ]
-                }
-            ],
-            "max_tokens": 300
-            }
-
-            response = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=payload)
-
-            #print(response.json())
-            response_json  = response.json()
-            #data = json.loads(response_json)
-            if 'error' in response_json:
-                return f"Error: {response_json['error']['message']} --- Please try again after a few seconds."
-            response = str(response_json['choices'][0]['message']['content'])
-            return response
-        except:
-            return "An error occurred while processing your request. Please try again."
+            # Use Groq with Llama 4 Scout (free vision model)
+            try:
+                chat_completion = groq_client.chat.completions.create(
+                    messages=[
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": [
+                            {"type": "text", "text": final_prompt},
+                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}},
+                        ]},
+                    ],
+                    model="meta-llama/llama-4-scout-17b-16e-instruct",
+                    max_tokens=500,
+                )
+                return chat_completion.choices[0].message.content
+            except Exception as groq_err:
+                # Fallback to Gemini
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                pil_image = Image.fromarray(frame_rgb)
+                response = gemini_client.models.generate_content(
+                    model="gemini-2.0-flash",
+                    contents=[final_prompt, pil_image],
+                )
+                return response.text
+        except Exception as e:
+            import traceback
+            err = traceback.format_exc()
+            return f"⚠️ **Error:** {e}\n\n```\n{err}\n```"
